@@ -1,0 +1,93 @@
+name: Build Calculator
+
+on:
+  push:
+    paths:
+      - 'app.zip'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Get files
+        uses: actions/checkout@v4
+
+      - name: Unzip the app
+        run: |
+          mkdir src
+          unzip -q app.zip -d src
+          SET=$(find src -maxdepth 3 -name settings.gradle | head -n 1)
+          if [ -z "$SET" ]; then echo "settings.gradle not found inside app.zip"; exit 1; fi
+          ROOT=$(dirname "$SET")
+          VNAME=$(grep -oP "versionName\s+'\K[^']+" "$ROOT/app/build.gradle")
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "VNAME=$VNAME" >> "$GITHUB_ENV"
+          echo "App version: $VNAME"
+
+      - name: Deploy server (Cloudflare Worker and database)
+        if: env.CF_TOKEN != ''
+        run: |
+          cd "$ROOT/worker"
+          export CLOUDFLARE_API_TOKEN="$CF_TOKEN"
+          export CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT"
+          npx --yes wrangler@3 d1 create calc-chat-db || echo "database already exists"
+          npx --yes wrangler@3 d1 list --json > d1.json
+          DBID=$(python3 -c "
+          import json
+          t = open('d1.json').read()
+          i = t.index('[')
+          for d in json.JSONDecoder().raw_decode(t[i:])[0]:
+              if d['name'] == 'calc-chat-db':
+                  print(d['uuid'])
+          ")
+          if [ -z "$DBID" ]; then echo "could not find the database id"; cat d1.json; exit 1; fi
+          printf 'name = "calc-chat"\nmain = "worker.js"\ncompatibility_date = "2024-11-01"\n\n[[d1_databases]]\nbinding = "DB"\ndatabase_name = "calc-chat-db"\ndatabase_id = "%s"\n' "$DBID" > wrangler.toml
+          npx --yes wrangler@3 deploy 2>&1 | tee deploy.log
+          URL=$(grep -oE 'https://[A-Za-z0-9.-]+\.workers\.dev' deploy.log | head -n 1)
+          echo "SERVER_URL=$URL" >> "$GITHUB_ENV"
+          echo "Server: $URL"
+
+      - name: Put server address and repo into the app
+        run: |
+          F="$ROOT/app/src/main/assets/www/config.js"
+          sed -i "s|__SERVER__|${SERVER_URL:-}|; s|__REPO__|${GITHUB_REPOSITORY}|" "$F"
+          cat "$F"
+
+      - name: Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Android SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+
+      - name: Build APK
+        run: |
+          cd "$ROOT"
+          gradle assembleRelease --no-daemon --stacktrace
+          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/Calculator.apk"
+          ls -la "$GITHUB_WORKSPACE/Calculator.apk"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VNAME }}
+          name: Calculator ${{ env.VNAME }}
+          files: Calculator.apk
+          make_latest: true
