@@ -49,11 +49,36 @@ jobs:
                   print(d['uuid'])
           ")
           if [ -z "$DBID" ]; then echo "could not find the database id"; cat d1.json; exit 1; fi
-          printf 'name = "calc-chat"\nmain = "worker.js"\ncompatibility_date = "2024-11-01"\n\n[[d1_databases]]\nbinding = "DB"\ndatabase_name = "calc-chat-db"\ndatabase_id = "%s"\n' "$DBID" > wrangler.toml
-          npx --yes wrangler@3 deploy 2>&1 | tee deploy.log
+          BASE='name = "calc-chat"\nmain = "worker.js"\ncompatibility_date = "2025-01-15"\n\n[[d1_databases]]\nbinding = "DB"\ndatabase_name = "calc-chat-db"\ndatabase_id = "%s"\n'
+          PUSH='\n[[durable_objects.bindings]]\nname = "HUB"\nclass_name = "Hub"\n\n[[migrations]]\ntag = "v1"\nnew_sqlite_classes = ["Hub"]\n'
+          printf "$BASE$PUSH" "$DBID" > wrangler.toml
+          set +e
+          npx --yes wrangler@3 deploy > deploy.log 2>&1
+          ST=$?
+          cat deploy.log
+          if [ $ST -ne 0 ]; then
+            echo "Deploy with instant push failed. Deploying without it (the app falls back to fast polling)."
+            printf "$BASE" "$DBID" > wrangler.toml
+            npx --yes wrangler@3 deploy > deploy.log 2>&1
+            ST=$?
+            cat deploy.log
+          fi
+          set -e
+          if [ $ST -ne 0 ]; then echo "Server deploy failed"; exit 1; fi
           URL=$(grep -oE 'https://[A-Za-z0-9.-]+\.workers\.dev' deploy.log | head -n 1)
           echo "SERVER_URL=$URL" >> "$GITHUB_ENV"
           echo "Server: $URL"
+
+      - name: Check the server
+        if: env.CF_TOKEN != ''
+        run: |
+          sleep 8
+          echo "--- ping"
+          curl -s --max-time 30 "$SERVER_URL/api/ping" || true
+          echo
+          echo "--- health"
+          curl -s --max-time 30 "$SERVER_URL/api/health" || true
+          echo
 
       - name: Put server address and repo into the app
         run: |
