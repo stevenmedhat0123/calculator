@@ -32,12 +32,18 @@ jobs:
           echo "VNAME=$VNAME" >> "$GITHUB_ENV"
           echo "App version: $VNAME"
 
-      - name: Deploy server (Cloudflare Worker and database)
+      - name: Deploy server (Cloudflare Worker, database and file storage)
         if: env.CF_TOKEN != ''
         run: |
           cd "$ROOT/worker"
           export CLOUDFLARE_API_TOKEN="$CF_TOKEN"
           export CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT"
+
+          # catch a typo in the server code before anything is deployed
+          cp worker.js /tmp/worker-check.mjs
+          node --check /tmp/worker-check.mjs
+
+          # ---- database (D1): only text and small data live here ----
           npx --yes wrangler@3 d1 create calc-chat-db || echo "database already exists"
           npx --yes wrangler@3 d1 list --json > d1.json
           DBID=$(python3 -c "
@@ -49,19 +55,73 @@ jobs:
                   print(d['uuid'])
           ")
           if [ -z "$DBID" ]; then echo "could not find the database id"; cat d1.json; exit 1; fi
+
+          # ---- file storage: photos, voice notes and files stay OUT of the database ----
+          # First choice: R2 (10 GB free). Second choice: Workers KV (1 GB free, no card needed).
+          set +e
+          STORE=''
+          STORE_KIND=none
+          npx --yes wrangler@3 r2 bucket create calc-chat-media > r2.log 2>&1
+          if [ $? -eq 0 ] || grep -qi "already exists" r2.log; then
+            STORE='\n[[r2_buckets]]\nbinding = "R2"\nbucket_name = "calc-chat-media"\n'
+            STORE_KIND=R2
+          else
+            echo "R2 is not available here:"; tail -n 5 r2.log
+            echo "Trying Workers KV for file storage instead."
+            kv_id() {
+              npx --yes wrangler@3 kv:namespace list > kv.json 2> kv.err
+              python3 -c "
+          import json
+          try:
+              t = open('kv.json').read()
+              i = t.index('[')
+              for d in json.JSONDecoder().raw_decode(t[i:])[0]:
+                  if str(d.get('title', '')).endswith('calc-chat-files'):
+                      print(d['id'])
+                      break
+          except Exception:
+              pass
+          "
+            }
+            KVID=$(kv_id)
+            if [ -z "$KVID" ]; then
+              npx --yes wrangler@3 kv:namespace create calc-chat-files > kv-create.log 2>&1
+              tail -n 5 kv-create.log
+              KVID=$(kv_id)
+            fi
+            if [ -n "$KVID" ]; then
+              STORE='\n[[kv_namespaces]]\nbinding = "KV"\nid = "%s"\n'
+              STORE=$(printf "$STORE" "$KVID")
+              STORE_KIND=KV
+            fi
+          fi
+          set -e
+          echo "File storage: $STORE_KIND"
+          echo "STORE_KIND=$STORE_KIND" >> "$GITHUB_ENV"
+          if [ "$STORE_KIND" = none ]; then
+            echo "::warning title=No file storage::Neither R2 nor KV could be set up, so sending photos, voice notes and files is switched off (text chat works). Fix: Cloudflare dashboard > My Profile > API Tokens > edit the token and add the permissions 'Workers R2 Storage: Edit' and/or 'Workers KV Storage: Edit', then run this workflow again."
+          fi
+
+          # ---- deploy the worker ----
           BASE='name = "calc-chat"\nmain = "worker.js"\ncompatibility_date = "2025-01-15"\n\n[[d1_databases]]\nbinding = "DB"\ndatabase_name = "calc-chat-db"\ndatabase_id = "%s"\n'
           PUSH='\n[[durable_objects.bindings]]\nname = "HUB"\nclass_name = "Hub"\n\n[[migrations]]\ntag = "v1"\nnew_sqlite_classes = ["Hub"]\n'
-          printf "$BASE$PUSH" "$DBID" > wrangler.toml
-          set +e
-          npx --yes wrangler@3 deploy > deploy.log 2>&1
-          ST=$?
-          cat deploy.log
-          if [ $ST -ne 0 ]; then
-            echo "Deploy with instant push failed. Deploying without it (the app falls back to fast polling)."
-            printf "$BASE" "$DBID" > wrangler.toml
+          try_deploy() {
+            printf "$1" "$DBID" > wrangler.toml
             npx --yes wrangler@3 deploy > deploy.log 2>&1
             ST=$?
             cat deploy.log
+            return $ST
+          }
+          set +e
+          try_deploy "$BASE$STORE$PUSH"; ST=$?
+          if [ $ST -ne 0 ]; then
+            echo "Deploy with instant push failed. Deploying without it (the app falls back to polling)."
+            try_deploy "$BASE$STORE"; ST=$?
+          fi
+          if [ $ST -ne 0 ] && [ -n "$STORE" ]; then
+            echo "Deploy with file storage failed. Deploying without file storage."
+            echo "::warning title=File storage off::The server was deployed without file storage because the deploy with it failed (see the log above)."
+            try_deploy "$BASE"; ST=$?
           fi
           set -e
           if [ $ST -ne 0 ]; then echo "Server deploy failed"; exit 1; fi
@@ -74,11 +134,18 @@ jobs:
         run: |
           sleep 8
           echo "--- ping"
-          curl -s --max-time 30 "$SERVER_URL/api/ping" || true
-          echo
+          PING=$(curl -s --max-time 30 "$SERVER_URL/api/ping" || true)
+          echo "$PING"
           echo "--- health"
           curl -s --max-time 30 "$SERVER_URL/api/health" || true
           echo
+          case "$PING" in
+            *'"store":"none"'*) echo "::warning title=No file storage::The server is running but has no file storage, so files cannot be sent." ;;
+            *'"store"'*) echo "File storage is ready." ;;
+          esac
+          case "$PING" in
+            *quota*|*exceeded*) echo "::notice title=Daily limit::The free daily database limit is used up right now. It resets by itself at 00:00 UTC (02:00 in Cairo). The deployment itself is fine." ;;
+          esac
 
       - name: Put server address and repo into the app
         run: |
@@ -104,10 +171,19 @@ jobs:
 
       - name: Build APK
         run: |
+          set -o pipefail
           cd "$ROOT"
-          gradle assembleRelease --no-daemon --stacktrace
+          gradle assembleRelease --no-daemon --console=plain --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
           cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/Calculator.apk"
           ls -la "$GITHUB_WORKSPACE/Calculator.apk"
+
+      - name: Why the build failed (first errors)
+        if: failure()
+        run: |
+          echo "=== Compiler errors ==="
+          grep -n -B2 -A8 "error:" build.log | head -n 120 || true
+          echo "=== What went wrong ==="
+          grep -n -A12 "What went wrong" build.log | head -n 60 || true
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -116,3 +192,4 @@ jobs:
           name: Calculator ${{ env.VNAME }}
           files: Calculator.apk
           make_latest: true
+          
